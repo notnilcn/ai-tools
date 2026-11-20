@@ -1,0 +1,52 @@
+{
+  "schema": "ai-tools/twin-verification@1",
+  "updated": "2026-11-18T00:00:00Z",
+  "legs": {
+    "reference": "reference",
+    "port": "port"
+  },
+  "terminal_statuses": [
+    "reference-verified",
+    "twin-verified"
+  ],
+  "items": {
+    "TWIN-0001": {
+      "title": "Replace with one verifiable behaviour",
+      "status": "seeded",
+      "fork": {
+        "reference": [
+          {
+            "tool": "replace-with-reference-tool",
+            "params": {}
+          }
+        ],
+        "port": [
+          {
+            "tool": "replace-with-port-tool",
+            "params": {}
+          }
+        ]
+      },
+      "action": {
+        "reference": [
+          {
+            "tool": "replace-with-reference-tool",
+            "params": {}
+          }
+        ],
+        "port": [
+          {
+            "tool": "replace-with-port-tool",
+            "params": {}
+          }
+        ]
+      },
+      "acceptance": [
+        "Replace with the observable assertion that closes this item."
+      ],
+      "notes": ""
+    }
+  },
+  "recipes": {},
+  "gaps": []
+}

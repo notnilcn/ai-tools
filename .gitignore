@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Transient state written by the two workflows. Everything here is local to a
+# checkout: nothing in these folders is generated at install time.
+
+# resource-gate state (limits, alert, monitor log, queue)
+.resource-monitor-limits
+.resource-monitor-limits.json
+.resource-queue/
+.tmp/
+
+# twin evidence and registry lock
+runs/
+TWIN-VERIFICATION.json.lock
+
+__pycache__/
+*.pyc
+*.tmp
