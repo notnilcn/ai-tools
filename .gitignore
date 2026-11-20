@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# This repository intentionally tracks only two workflow folders. Everything
+# else (including the resource-monitor limits file written at the repo root)
+# stays untracked.
+*
+!.gitignore
+!/twin/
+!/twin/**
+!/resource-gate/
+!/resource-gate/**
