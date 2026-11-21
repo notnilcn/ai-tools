@@ -8,6 +8,13 @@ A twin walk proves that one item of a **port** (the code under test) behaves
 like its **reference** (the read-only implementation it is meant to match).
 One item at a time, one comparison gate, one durable status.
 
+The same registry and evidence layout also support a **single-leg walk**: the
+implementation under test is driven and documented on its own, with no
+counterpart. A single-leg registry sets `"mode": "single"` (or declares a
+`legs` object with only `port`) and uses `prompts/feature-checker.md`; there is
+no `TWIN_COUNTERPART.md` and no reference folder. Use it to map out a feature
+surface before any fixer runs.
+
 ## Counterpart contract
 
 The concrete counterpart is not part of this folder. Read the repository's
@@ -16,7 +23,9 @@ reference checkout, the reference/port legs, how to inspect the reference, and
 the repository-specific commands. Copy
 [`templates/TWIN-COUNTERPART.md`](templates/TWIN-COUNTERPART.md) to the
 repository root to create it. Put any Windows-only details (launcher, bridge
-port, screenshot path, profile rules) in that same contract.
+port, screenshot path, profile rules) in that same contract. A single-leg
+registry does not need it; put the launch, input and capture commands in the
+repository's own docs or in the registry recipes instead.
 
 Nothing in this folder may hardcode those details: no paths, ports, window
 titles, runtime flags, scene names or capture commands.
@@ -27,11 +36,14 @@ titles, runtime flags, scene names or capture commands.
 |---|---|
 | [`WORKFLOW.md`](WORKFLOW.md) | The workflow: vocabulary, registry, statuses, evidence layout, checker/fixer loop and comparison gate. |
 | [`twin_verify.ps1`](twin_verify.ps1) | Windows launcher for the registry tool. |
-| [`twin_verify.py`](twin_verify.py) | Cross-platform registry validator and queue helper: `check`, `next`, `stats`, `list`, `set-status`. |
+| [`twin_verify.py`](twin_verify.py) | Cross-platform registry validator and queue helper: `check`, `next`, `stats`, `list`, `set-status`, `set-action`. |
 | [`twin_item.ps1`](twin_item.ps1) | Windows per-item evidence helper: `dir`, `stamp`, `capture`, `note`, `log`. |
 | [`prompts/checker.md`](prompts/checker.md) | Prompt template for one sequential checker. |
 | [`prompts/fixer.md`](prompts/fixer.md) | Prompt template for the single nested fixer a checker may spawn. |
+| [`prompts/feature-checker.md`](prompts/feature-checker.md) | Prompt template for one single-leg feature checker. |
+| [`prompts/feature-fixer.md`](prompts/feature-fixer.md) | Prompt template for a fixer working from a single-leg bug item. |
 | [`templates/TWIN-VERIFICATION.json`](templates/TWIN-VERIFICATION.json) | Starter registry; copy it to the repository root and replace the legs/items. |
+| [`templates/FEATURE-VERIFICATION.json`](templates/FEATURE-VERIFICATION.json) | Starter single-leg registry with no counterpart. |
 | [`templates/TWIN-COUNTERPART.md`](templates/TWIN-COUNTERPART.md) | Starter counterpart contract; copy it to the repository root. |
 
 Use Windows PowerShell 5.1 or PowerShell 7. If execution policy blocks the
@@ -53,7 +65,9 @@ any directory. Override with `TWIN_ROOT`, `--root`, `--registry`, `--runs` or
   fixer, waits for it, verifies the result, then stops.
 - **Two terminal statuses only:** `reference-verified` (the port matched the
   recorded reference without a code change) and `twin-verified` (a gap was
-  fixed and fresh reference + port legs match).
+  fixed and fresh reference + port legs match). A single-leg registry declares
+  its own terminal statuses; the recommended set is `verified`, `bug`, `fixed`,
+  `blocked` and `wontfix`.
 - **The registry is the durable verdict.** Frames and run reports live under
   the git-ignored `runs/` tree; only the registry is committed.
 - **No repository-specific facts here.** They belong in the repository's

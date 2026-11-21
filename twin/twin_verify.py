@@ -4,7 +4,9 @@
 
 This is the repository-agnostic companion to the workflow in ``WORKFLOW.md``. It
 knows nothing about a particular reference or port: the leg names, statuses and
-evidence root all come from the registry or from command-line flags.
+evidence root all come from the registry or from command-line flags. A
+single-leg registry (``"mode": "single"`` or a ``legs`` object with only
+``port``) records one implementation and needs no reference leg.
 
 Run it from anywhere:
 
@@ -31,6 +33,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,7 +46,9 @@ except ImportError:  # pragma: no cover
 REGISTRY_NAME = "TWIN-VERIFICATION.json"
 DEFAULT_SCHEMA = "ai-tools/twin-verification@1"
 DEFAULT_LEGS = {"reference": "reference", "port": "port"}
+SINGLE_LEGS = {"port": "port"}
 DEFAULT_TERMINAL = ("reference-verified", "twin-verified")
+SINGLE_TERMINAL = ("verified", "bug", "fixed", "blocked", "wontfix")
 DEFAULT_STATUSES = (
     "seeded",
     "in-progress",
@@ -53,6 +58,16 @@ DEFAULT_STATUSES = (
     "wontfix",
     "reference-verified",
     "twin-verified",
+)
+SINGLE_STATUSES = (
+    "seeded",
+    "in-progress",
+    "bug",
+    "fixing",
+    "fixed",
+    "verified",
+    "blocked",
+    "wontfix",
 )
 ITEM_ID_RE = re.compile(r"^[A-Z][A-Z0-9]*-\d{3,}$")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif"}
@@ -113,9 +128,22 @@ def _load(path: Path) -> dict[str, Any]:
     return doc
 
 
+def _single_mode(doc: dict[str, Any]) -> bool:
+    """A single-leg registry records one implementation, with no counterpart."""
+    mode = doc.get("mode")
+    if mode in ("single", "feature-walk", "single-leg"):
+        return True
+    raw = doc.get("legs")
+    if isinstance(raw, dict) and raw and "reference" not in raw and "port" in raw:
+        return True
+    return False
+
+
 def _legs(doc: dict[str, Any]) -> dict[str, str]:
     raw = doc.get("legs")
     if raw is None:
+        if _single_mode(doc):
+            return {"port": os.environ.get("TWIN_PORT_LEG", SINGLE_LEGS["port"])}
         # Generic default, or the leg names the evidence helper uses.
         return {
             "reference": os.environ.get("TWIN_REFERENCE_LEG", DEFAULT_LEGS["reference"]),
@@ -123,6 +151,11 @@ def _legs(doc: dict[str, Any]) -> dict[str, str]:
         }
     if not isinstance(raw, dict):
         raise SystemExit("twin_verify: legs must be an object")
+    if _single_mode(doc):
+        value = raw.get("port", SINGLE_LEGS["port"])
+        if not isinstance(value, str) or not value.strip():
+            raise SystemExit("twin_verify: legs.port must be a non-empty string")
+        return {"port": value}
     legs: dict[str, str] = {}
     for role in ("reference", "port"):
         value = raw.get(role, role)
@@ -135,7 +168,7 @@ def _legs(doc: dict[str, Any]) -> dict[str, str]:
 def _terminal(doc: dict[str, Any]) -> tuple[str, ...]:
     raw = doc.get("terminal_statuses")
     if raw is None:
-        return DEFAULT_TERMINAL
+        return SINGLE_TERMINAL if _single_mode(doc) else DEFAULT_TERMINAL
     if not isinstance(raw, list) or not raw or not all(isinstance(s, str) for s in raw):
         raise SystemExit("twin_verify: terminal_statuses must be a non-empty string list")
     return tuple(raw)
@@ -144,7 +177,7 @@ def _terminal(doc: dict[str, Any]) -> tuple[str, ...]:
 def _statuses(doc: dict[str, Any]) -> tuple[str, ...]:
     raw = doc.get("statuses")
     if raw is None:
-        return DEFAULT_STATUSES
+        return SINGLE_STATUSES if _single_mode(doc) else DEFAULT_STATUSES
     if not isinstance(raw, list) or not all(isinstance(s, str) for s in raw):
         raise SystemExit("twin_verify: statuses must be a string list")
     return tuple(raw)
@@ -251,15 +284,19 @@ def check(doc: dict[str, Any], registry: Path, runs: Path, evidence: bool) -> li
 
         if evidence and status in terminal:
             item_root = runs / item_id
-            reference_dir = item_root / legs["reference"]
             port_dir = item_root / legs["port"]
-            if not port_dir.is_dir() or not any(port_dir.iterdir()):
-                errors.append(f"{item_id}: terminal status needs a non-empty {legs['port']}/ folder")
-            if status == "twin-verified":
-                if not reference_dir.is_dir() or not any(reference_dir.iterdir()):
-                    errors.append(
-                        f"{item_id}: twin-verified needs a non-empty {legs['reference']}/ folder"
-                    )
+            if "reference" in legs:
+                if status not in ("blocked", "wontfix"):
+                    if not port_dir.is_dir() or not any(port_dir.iterdir()):
+                        errors.append(
+                            f"{item_id}: terminal status needs a non-empty {legs['port']}/ folder"
+                        )
+                if status == "twin-verified":
+                    reference_dir = item_root / legs["reference"]
+                    if not reference_dir.is_dir() or not any(reference_dir.iterdir()):
+                        errors.append(
+                            f"{item_id}: twin-verified needs a non-empty {legs['reference']}/ folder"
+                        )
             reports = list(item_root.glob("*-run.md")) if item_root.is_dir() else []
             if not reports:
                 errors.append(f"{item_id}: terminal status needs a *-run.md report")
@@ -397,26 +434,82 @@ def _write_locked(path: Path, doc: dict[str, Any]) -> None:
         os.replace(tmp, path)
 
 
+def _update_locked(path: Path, mutate: Any) -> dict[str, Any]:
+    """Read, mutate and write under one lock so parallel agents do not clobber."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        if fcntl is not None:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        doc = _load(path)
+        mutate(doc)
+        doc["updated"] = _now()
+        tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return doc
+
+
 def cmd_set_status(args: argparse.Namespace) -> int:
+    root = _registry_root(args)
+    registry = _registry_path(args, root)
+    doc_preview = _load(registry)
+    allowed = set(_statuses(doc_preview)) | set(_terminal(doc_preview)) | set(DEFAULT_STATUSES)
+    if args.status not in allowed:
+        raise SystemExit(f"twin_verify: unknown status {args.status!r}")
+    if args.similarity is not None and not 0 <= args.similarity <= 100:
+        raise SystemExit("twin_verify: --similarity must be 0..100")
+    if args.item_id not in (doc_preview.get("items") or {}):
+        raise SystemExit(f"twin_verify: unknown item {args.item_id}")
+
+    def mutate(doc: dict[str, Any]) -> None:
+        item = doc["items"][args.item_id]
+        item["status"] = args.status
+        if args.note:
+            item["notes"] = args.note
+        if args.similarity is not None:
+            item["similarity"] = args.similarity
+
+    _update_locked(registry, mutate)
+    print(f"{args.item_id}: {args.status}")
+    return 0
+
+
+def cmd_set_action(args: argparse.Namespace) -> int:
     root = _registry_root(args)
     registry = _registry_path(args, root)
     doc = _load(registry)
     item = (doc.get("items") or {}).get(args.item_id)
     if item is None:
         raise SystemExit(f"twin_verify: unknown item {args.item_id}")
-    allowed = set(_statuses(doc)) | set(_terminal(doc)) | set(DEFAULT_STATUSES)
-    if args.status not in allowed:
-        raise SystemExit(f"twin_verify: unknown status {args.status!r}")
-    item["status"] = args.status
-    if args.note:
-        item["notes"] = args.note
-    if args.similarity is not None:
-        if not 0 <= args.similarity <= 100:
-            raise SystemExit("twin_verify: --similarity must be 0..100")
-        item["similarity"] = args.similarity
-    doc["updated"] = _now()
-    _write_locked(registry, doc)
-    print(f"{args.item_id}: {args.status}")
+    legs = _legs(doc)
+    role = args.leg
+    if role not in legs:
+        raise SystemExit(f"twin_verify: unknown leg role {role!r} (have {', '.join(legs)})")
+    chain_text = Path(args.file).read_text(encoding="utf-8") if args.file else args.json
+    if chain_text is None:
+        raise SystemExit("twin_verify: set-action needs --json or --file")
+    try:
+        chain = json.loads(chain_text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"twin_verify: invalid JSON chain: {exc}")
+    errors: list[str] = []
+    _call_chain(chain, f"{args.item_id}: {args.phase}.{role}", errors)
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+    def mutate(doc: dict[str, Any]) -> None:
+        item = doc["items"][args.item_id]
+        phase = item.get(args.phase)
+        if not isinstance(phase, dict):
+            phase = {}
+            item[args.phase] = phase
+        phase[legs[role]] = chain
+
+    _update_locked(registry, mutate)
+    print(f"{args.item_id}: {args.phase}.{legs[role]} <- {len(chain)} call(s)")
     return 0
 
 
@@ -462,6 +555,16 @@ def main(argv: list[str] | None = None) -> int:
     set_parser.add_argument("--note")
     set_parser.add_argument("--similarity", type=float)
     set_parser.set_defaults(func=cmd_set_status)
+
+    action_parser = _common(
+        sub.add_parser("set-action", help="replace one item's recorded fork/action chain")
+    )
+    action_parser.add_argument("item_id")
+    action_parser.add_argument("--leg", default="port", choices=("port", "reference"))
+    action_parser.add_argument("--phase", default="action", choices=("fork", "action"))
+    action_parser.add_argument("--json", help="JSON list of tool calls")
+    action_parser.add_argument("--file", help="file holding the JSON list of tool calls")
+    action_parser.set_defaults(func=cmd_set_action)
 
     args = parser.parse_args(argv)
     return args.func(args)

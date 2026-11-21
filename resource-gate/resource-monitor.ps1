@@ -21,6 +21,11 @@
 # the monitor blame the wave. Override the per-subagent assumptions with
 # RESOURCE_MONITOR_AGENT_CPU_PERCENT / RESOURCE_MONITOR_AGENT_RAM_MB.
 #
+# With --claude-usage-percent the monitor also polls `claude -p /usage` and
+# caps the recommendation at one Claude subagent once the current 5-hour
+# session usage reaches that percentage. Agents of other providers are not
+# capped by it.
+#
 # Usage:
 #   resource-monitor.ps1 [options]
 #
@@ -31,6 +36,11 @@
 #   --disk-percent N       used-space ceiling for watched drives (saved)
 #   --disk-write-mb N      unqueued writes per sample that count as pressure (saved)
 #   --streak N             consecutive samples over a limit before alerting (saved)
+#   --claude-usage-percent N
+#                          cap Claude subagents at one when the current session
+#                          usage reaches N%; 0 disables the check (saved)
+#   --claude-usage-interval SECS
+#                          seconds between `claude -p /usage` polls (saved)
 #   --init                 save the supplied limits and exit
 #   --path PATH            file/directory whose drive to watch; repeatable
 #   --state-dir DIR        lock, limits, alert and scratch state
@@ -65,6 +75,9 @@
 #   RESOURCE_MONITOR_DISK_PERCENT    default for --disk-percent
 #   RESOURCE_MONITOR_DISK_WRITE_MB   default for --disk-write-mb
 #   RESOURCE_MONITOR_STREAK          default for --streak
+#   RESOURCE_MONITOR_CLAUDE_USAGE_PERCENT   default for --claude-usage-percent
+#   RESOURCE_MONITOR_CLAUDE_USAGE_INTERVAL  default for --claude-usage-interval
+#   RESOURCE_MONITOR_CLAUDE_BIN      Claude CLI to poll (default: claude)
 #   RESOURCE_MONITOR_MAX_PARALLEL    hard cap on the recommendation (default 6)
 #   RESOURCE_MONITOR_AGENT_CPU_PERCENT  CPU one subagent is assumed to use (100)
 #   RESOURCE_MONITOR_AGENT_RAM_MB    RAM one subagent is assumed to use (2048)
@@ -160,6 +173,8 @@ $Options = [ordered]@{
     Disk = $null
     DiskWrite = $null
     Streak = $null
+    ClaudeUsage = $null
+    ClaudeUsageInterval = $null
     Paths = @()
     StateDir = $null
     AlertFile = $null
@@ -199,6 +214,14 @@ while ($i -lt $RawArgs.Count) {
     if ($arg -eq '--streak') {
         if ($i + 1 -ge $RawArgs.Count) { Fail '--streak needs a value' }
         $Options.Streak = [string]$RawArgs[$i + 1]; $i += 2; continue
+    }
+    if ($arg -eq '--claude-usage-percent') {
+        if ($i + 1 -ge $RawArgs.Count) { Fail '--claude-usage-percent needs a value' }
+        $Options.ClaudeUsage = [string]$RawArgs[$i + 1]; $i += 2; continue
+    }
+    if ($arg -eq '--claude-usage-interval') {
+        if ($i + 1 -ge $RawArgs.Count) { Fail '--claude-usage-interval needs a value' }
+        $Options.ClaudeUsageInterval = [string]$RawArgs[$i + 1]; $i += 2; continue
     }
     if ($arg -eq '--path') {
         if ($i + 1 -ge $RawArgs.Count) { Fail '--path needs a value' }
@@ -291,6 +314,8 @@ $RamLimitRaw = Get-ConfigValue $Options.Ram 'RESOURCE_MONITOR_RAM_PERCENT' $File
 $DiskLimitRaw = Get-ConfigValue $Options.Disk 'RESOURCE_MONITOR_DISK_PERCENT' $FileLimits 'disk_percent' ''
 $DiskWriteRaw = Get-ConfigValue $Options.DiskWrite 'RESOURCE_MONITOR_DISK_WRITE_MB' $FileLimits 'disk_write_mb' '512'
 $StreakRaw = Get-ConfigValue $Options.Streak 'RESOURCE_MONITOR_STREAK' $FileLimits 'streak' ''
+$ClaudeUsageRaw = Get-ConfigValue $Options.ClaudeUsage 'RESOURCE_MONITOR_CLAUDE_USAGE_PERCENT' $FileLimits 'claude_usage_percent' '0'
+$ClaudeUsageIntervalRaw = Get-ConfigValue $Options.ClaudeUsageInterval 'RESOURCE_MONITOR_CLAUDE_USAGE_INTERVAL' $FileLimits 'claude_usage_interval' '300'
 
 if (-not $CpuLimitRaw -or -not $RamLimitRaw -or -not $DiskLimitRaw -or -not $StreakRaw) {
     [Console]::Error.WriteLine('resource-monitor: warning limits are not defined.')
@@ -306,6 +331,8 @@ $RamLimit = To-Int $RamLimitRaw '--ram-percent'
 $DiskLimit = To-Int $DiskLimitRaw '--disk-percent'
 $DiskWriteMb = To-Int $DiskWriteRaw '--disk-write-mb'
 $Streak = To-Int $StreakRaw '--streak'
+$ClaudeUsageLimit = To-Int $ClaudeUsageRaw '--claude-usage-percent'
+$ClaudeUsageInterval = To-Int $ClaudeUsageIntervalRaw '--claude-usage-interval'
 $MaxSamples = To-Int ([string]$Options.MaxSamples) '--max-samples'
 
 if ($Interval -lt 1) { Fail '--interval must be at least 1' }
@@ -314,6 +341,8 @@ if ($Streak -lt 1) { Fail '--streak must be at least 1' }
 if ($CpuLimit -lt 1 -or $CpuLimit -gt 100) { Fail '--cpu-percent must be 1..100' }
 if ($RamLimit -lt 1 -or $RamLimit -gt 100) { Fail '--ram-percent must be 1..100' }
 if ($DiskLimit -lt 1 -or $DiskLimit -gt 100) { Fail '--disk-percent must be 1..100' }
+if ($ClaudeUsageLimit -lt 0 -or $ClaudeUsageLimit -gt 100) { Fail '--claude-usage-percent must be 0..100' }
+if ($ClaudeUsageInterval -lt 10) { Fail '--claude-usage-interval must be at least 10 seconds' }
 
 function Write-Utf8([string]$Path, [string]$Text) {
     [System.IO.File]::WriteAllText($Path, $Text, $script:Utf8NoBom)
@@ -327,6 +356,8 @@ function Save-Limits {
         disk_percent = $DiskLimit
         disk_write_mb = $DiskWriteMb
         streak = $Streak
+        claude_usage_percent = $ClaudeUsageLimit
+        claude_usage_interval = $ClaudeUsageInterval
     }
     $parent = [System.IO.Path]::GetDirectoryName($LimitsFile)
     if ($parent -and -not (Test-Path $parent)) {
@@ -354,6 +385,17 @@ if ($env:RESOURCE_MONITOR_AGENT_RAM_MB) { $AgentRamMb = To-Int $env:RESOURCE_MON
 if ($MaxParallel -lt 0) { $MaxParallel = 0 }
 if ($AgentCpuPercent -lt 1) { $AgentCpuPercent = 1 }
 if ($AgentRamMb -lt 1) { $AgentRamMb = 1 }
+
+# Claude session usage gate. The monitor polls the CLI at most once per
+# ClaudeUsageInterval seconds and never lets its own poll become the wave.
+$ClaudeBin = if ($env:RESOURCE_MONITOR_CLAUDE_BIN) { $env:RESOURCE_MONITOR_CLAUDE_BIN } else { 'claude' }
+$ClaudeTimeout = 45
+if ($env:RESOURCE_MONITOR_CLAUDE_TIMEOUT) { $ClaudeTimeout = To-Int $env:RESOURCE_MONITOR_CLAUDE_TIMEOUT 'RESOURCE_MONITOR_CLAUDE_TIMEOUT' }
+$script:ClaudeSessionPercent = $null
+$script:ClaudeUsageAt = ''
+$script:ClaudeUsageError = ''
+$script:ClaudeUsageReduced = $false
+$script:ClaudeUsageNextAt = $null
 
 $UseLock = -not $Options.NoLock
 if ($Options.Once) { $UseLock = $false }
@@ -759,7 +801,70 @@ function Update-Recommendation {
     $recommended = [Math]::Min([double]$byCpu, [double]$byRam)
     $recommended = [Math]::Min($recommended, [double]$MaxParallel)
     if ($recommended -lt 0) { $recommended = 0 }
+
+    $script:ClaudeUsageReduced = $false
+    if ($ClaudeUsageLimit -gt 0 -and $null -ne $script:ClaudeSessionPercent -and
+        $script:ClaudeSessionPercent -ge $ClaudeUsageLimit) {
+        $script:ClaudeUsageReduced = $true
+        if ($recommended -gt 1) { $recommended = 1 }
+    }
     $script:RecommendedParallel = [int]$recommended
+}
+
+function Update-ClaudeUsage {
+    if ($ClaudeUsageLimit -le 0) { return }
+    $now = Get-Date
+    if ($null -ne $script:ClaudeUsageNextAt -and $now -lt $script:ClaudeUsageNextAt) {
+        return
+    }
+    $script:ClaudeUsageNextAt = $now.AddSeconds($ClaudeUsageInterval)
+
+    if (-not (Get-Command $ClaudeBin -ErrorAction SilentlyContinue)) {
+        $script:ClaudeUsageError = "Claude CLI not found: $ClaudeBin"
+        Write-LogLine "resource-monitor: claude usage unavailable ($script:ClaudeUsageError)"
+        return
+    }
+
+    # Poll in a job so a hung CLI cannot stall the monitor; bash uses `timeout`.
+    $job = Start-Job -ScriptBlock {
+        param($Bin)
+        $text = (& $Bin -p '/usage' 2>&1 | Out-String)
+        [pscustomobject]@{ Text = $text; ExitCode = $LASTEXITCODE }
+    } -ArgumentList $ClaudeBin
+    $done = Wait-Job -Job $job -Timeout $ClaudeTimeout
+    if (-not $done) {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        $script:ClaudeUsageError = 'claude -p /usage failed or timed out'
+        Write-LogLine "resource-monitor: claude usage unavailable ($script:ClaudeUsageError)"
+        return
+    }
+    $result = Receive-Job -Job $job
+    $state = $job.State
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    if ($state -ne 'Completed' -or ($null -ne $result.ExitCode -and $result.ExitCode -ne 0)) {
+        $script:ClaudeUsageError = 'claude -p /usage failed or timed out'
+        Write-LogLine "resource-monitor: claude usage unavailable ($script:ClaudeUsageError)"
+        return
+    }
+
+    $ansi = ([string][char]27) + '\[[0-9;]*[A-Za-z]'
+    $clean = [string]$result.Text -replace $ansi, ''
+    $match = [regex]::Match($clean, 'Current session:\s*(\d+)%\s*used', 'IgnoreCase')
+    if (-not $match.Success) {
+        $script:ClaudeUsageError = "could not parse 'Current session' from claude -p /usage"
+        Write-LogLine "resource-monitor: claude usage unavailable ($script:ClaudeUsageError)"
+        return
+    }
+
+    $script:ClaudeSessionPercent = [int]$match.Groups[1].Value
+    $script:ClaudeUsageAt = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $script:ClaudeUsageError = ''
+    if ($script:ClaudeSessionPercent -ge $ClaudeUsageLimit) {
+        Write-LogLine "resource-monitor: claude session usage $($script:ClaudeSessionPercent)% >= ${ClaudeUsageLimit}%: capping Claude subagents at 1"
+    } else {
+        Write-LogLine "resource-monitor: claude session usage $($script:ClaudeSessionPercent)% (limit ${ClaudeUsageLimit}%)"
+    }
 }
 
 function Emit-Sample {
@@ -773,6 +878,11 @@ function Emit-Sample {
     }
     if ($script:DiskDeferred) { $diskText = "$diskText deferred" }
     $queueText = if ($script:QueueActive) { "busy($script:QueueTask)" } else { 'idle' }
+
+    $claudePercent = $null
+    if ($null -ne $script:ClaudeSessionPercent) { $claudePercent = [int]$script:ClaudeSessionPercent }
+    $claudeLimit = $null
+    if ($ClaudeUsageLimit -gt 0) { $claudeLimit = $ClaudeUsageLimit }
 
     if ($Options.Json) {
         $sample = [ordered]@{
@@ -789,6 +899,11 @@ function Emit-Sample {
             queue_active = [bool]$script:QueueActive
             queue_task = $script:QueueTask
             recommended_parallel_subagents = $script:RecommendedParallel
+            claude_session_percent = $claudePercent
+            claude_usage_limit_percent = $claudeLimit
+            claude_usage_reduced = [bool]$script:ClaudeUsageReduced
+            claude_usage_error = $script:ClaudeUsageError
+            claude_usage_at = $script:ClaudeUsageAt
             streaks = [ordered]@{
                 cpu = $script:CpuStreak
                 ram = $script:RamStreak
@@ -800,7 +915,9 @@ function Emit-Sample {
         Write-Output $line
         if ($LogFile) { [System.IO.File]::AppendAllText($LogFile, $line + "`n", $script:Utf8NoBom) }
     } else {
-        Write-LogLine "cpu=${cpuText}% ram=${ramText}% disk=${diskText} write=${writeText}MB queue=${queueText} parallel=$($script:RecommendedParallel)"
+        $claudeText = if ($null -ne $claudePercent) { "$claudePercent" } else { 'null' }
+        $capText = if ($script:ClaudeUsageReduced) { ' cap=1' } else { '' }
+        Write-LogLine "cpu=${cpuText}% ram=${ramText}% disk=${diskText} write=${writeText}MB queue=${queueText} parallel=$($script:RecommendedParallel) claude=${claudeText}%${capText}"
     }
 }
 
@@ -858,6 +975,10 @@ function Write-Alert {
     $protected = @($protected | Sort-Object -Unique)
     $queuePidJson = if ($script:QueuePid -gt 0) { [int]$script:QueuePid } else { $null }
     $queueText = if ($script:QueueActive) { "busy($script:QueueTask)" } else { 'idle' }
+    $claudePercent = $null
+    if ($null -ne $script:ClaudeSessionPercent) { $claudePercent = [int]$script:ClaudeSessionPercent }
+    $claudeLimit = $null
+    if ($ClaudeUsageLimit -gt 0) { $claudeLimit = $ClaudeUsageLimit }
 
     $processes = @()
     foreach ($candidate in $top) {
@@ -882,6 +1003,8 @@ function Write-Alert {
             disk_write_mb = $DiskWriteMb
             streak = $Streak
             interval_s = $Interval
+            claude_usage_percent = $claudeLimit
+            claude_usage_interval_s = $ClaudeUsageInterval
         }
         metrics = [ordered]@{
             cpu_percent = [double]($script:CpuTenths / 10.0)
@@ -902,12 +1025,19 @@ function Write-Alert {
             parallel_subagents = 0
             note = '0 means stop spawning; restart only after two clean samples.'
         }
+        claude_usage = [ordered]@{
+            session_percent = $claudePercent
+            limit_percent = $claudeLimit
+            reduced_to_one = [bool]$script:ClaudeUsageReduced
+            at = $script:ClaudeUsageAt
+            error = $script:ClaudeUsageError
+        }
         protected_pids = $protected
         reasons = $reasons
         disk = $script:DiskList
         processes = $processes
         kill_note = 'Kill only PID trees that belong to the tasks you stop; verify path/cmd first. Never kill the monitor, its ancestors, the orchestrator, or the queue holder.'
-        required_action = 'Stop spawning subagents. Kill the process trees of the tasks you stop (see processes above; verify path/cmd first). Reduce parallelism 6->4->2->1. Restart the monitor only after two clean samples.'
+        required_action = 'Stop spawning subagents. Kill the process trees of the tasks you stop (see processes above; verify path/cmd first). Reduce parallelism 6->4->2->1. Keep at most one Claude subagent while claude_usage.reduced_to_one is true. Restart the monitor only after two clean samples.'
     }
 
     $alertTmp = "$AlertFile.tmp"
@@ -925,6 +1055,15 @@ function Write-Alert {
         Write-AlertLine "  disk: $(Format-Tenths $script:DiskMaxUsedTenths)% used (limit ${DiskLimit}%)"
     }
     Write-AlertLine "  unmanaged writes: $(Format-Tenths $script:WriteMbTenths)MB/sample (limit ${DiskWriteMb}MB)"
+    if ($ClaudeUsageLimit -gt 0) {
+        if ($null -ne $script:ClaudeSessionPercent) {
+            $capText = if ($script:ClaudeUsageReduced) { ', capped at 1 Claude subagent' } else { '' }
+            Write-AlertLine "  claude session usage: $($script:ClaudeSessionPercent)% (limit ${ClaudeUsageLimit}%)${capText}"
+        } else {
+            $reason = if ($script:ClaudeUsageError) { $script:ClaudeUsageError } else { 'not polled yet' }
+            Write-AlertLine "  claude session usage: unavailable ($reason; limit ${ClaudeUsageLimit}%)"
+        }
+    }
     Write-AlertLine "  queue: $queueText"
     Write-AlertLine '  recommended parallel subagents: 0'
     if ($top.Count -eq 0) {
@@ -946,6 +1085,11 @@ function Write-Alert {
 # --- main loop -------------------------------------------------------------
 
 Write-LogLine "resource-monitor: watching $($WatchPaths -join ', ') every ${Interval}s (cpu<=${CpuLimit}%, ram<=${RamLimit}%, disk<${DiskLimit}%, writes<=${DiskWriteMb}MB, streak=${Streak})"
+if ($ClaudeUsageLimit -gt 0) {
+    Write-LogLine "resource-monitor: Claude session usage gate: cap at 1 subagent from ${ClaudeUsageLimit}% (poll every ${ClaudeUsageInterval}s)"
+} else {
+    Write-LogLine 'resource-monitor: Claude session usage gate: disabled'
+}
 Write-LogLine 'resource-monitor: queue-exempt = the monitor, its ancestors, the queue holder and its process tree, and the holder trees that finished recently'
 Write-LogLine "resource-monitor: alert json: $AlertFile"
 
@@ -957,6 +1101,7 @@ try {
         Get-ProcessSnapshot
         Update-DiskUsage
         Update-Exemptions
+        Update-ClaudeUsage
         Update-Metrics
         Update-Streaks
         Update-Recommendation

@@ -19,9 +19,12 @@
 #   TWIN_RUNS            evidence root (default: <root>\runs)
 #   TWIN_REFERENCE_LEG   reference leg folder name (default: reference)
 #   TWIN_PORT_LEG        port leg folder name (default: port)
+#   TWIN_SINGLE          set to 1 to record one leg only (no reference folder)
 #
-# The two leg names must match the registry's "legs" object and
-# TWIN_COUNTERPART.md.
+# The leg names must match the registry's "legs" object and
+# TWIN_COUNTERPART.md. A registry with "mode": "single" (or a "legs" object
+# without a reference role) is recorded as a single-leg walk automatically:
+# only the port folder is created and `capture reference` is rejected.
 
 $ErrorActionPreference = 'Stop'
 
@@ -79,6 +82,39 @@ function Get-RepoRoot {
     return (Get-Location).Path
 }
 
+function Read-Registry {
+    $registry = Join-Path $Root 'TWIN-VERIFICATION.json'
+    if (-not (Test-Path -LiteralPath $registry)) { return $null }
+    try {
+        return (Get-Content -Raw -LiteralPath $registry | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
+function Test-SingleRegistry([object]$Doc) {
+    if ($null -eq $Doc) { return $false }
+    if ($Doc.mode -in @('single', 'feature-walk', 'single-leg')) { return $true }
+    $legs = $Doc.legs
+    if ($null -ne $legs -and $legs -is [System.Management.Automation.PSCustomObject]) {
+        $hasPort = $null -ne $legs.PSObject.Properties['port']
+        $hasReference = $null -ne $legs.PSObject.Properties['reference']
+        if ($hasPort -and -not $hasReference) { return $true }
+    }
+    return $false
+}
+
+function Get-RegistryLeg([object]$Doc, [string]$Role) {
+    if ($null -eq $Doc) { return '' }
+    $legs = $Doc.legs
+    if ($null -eq $legs -or $legs -isnot [System.Management.Automation.PSCustomObject]) { return '' }
+    $property = $legs.PSObject.Properties[$Role]
+    if (-not $property) { return '' }
+    $value = $property.Value
+    if ($value -is [string] -and $value.Trim()) { return $value }
+    return ''
+}
+
 $Root = Get-RepoRoot
 if ($env:TWIN_RUNS) {
     $Runs = [System.IO.Path]::GetFullPath($env:TWIN_RUNS)
@@ -87,6 +123,15 @@ if ($env:TWIN_RUNS) {
 }
 $ReferenceLeg = if ($env:TWIN_REFERENCE_LEG) { $env:TWIN_REFERENCE_LEG } else { 'reference' }
 $PortLeg = if ($env:TWIN_PORT_LEG) { $env:TWIN_PORT_LEG } else { 'port' }
+
+$Registry = Read-Registry
+$Single = ($env:TWIN_SINGLE -eq '1') -or (Test-SingleRegistry $Registry)
+$registryReference = Get-RegistryLeg $Registry 'reference'
+$registryPort = Get-RegistryLeg $Registry 'port'
+if (-not $Single -and $registryReference) { $ReferenceLeg = $registryReference }
+if ($registryPort) { $PortLeg = $registryPort }
+if ($env:TWIN_REFERENCE_LEG) { $ReferenceLeg = $env:TWIN_REFERENCE_LEG }
+if ($env:TWIN_PORT_LEG) { $PortLeg = $env:TWIN_PORT_LEG }
 
 function Get-Stamp {
     return (Get-Date).ToString('yyyyMMdd-HHmmss')
@@ -108,7 +153,10 @@ function Assert-ItemId([string]$Id) {
 
 function Get-LegName([string]$Leg) {
     switch ($Leg) {
-        'reference' { return $ReferenceLeg }
+        'reference' {
+            if ($Single) { Fail 'this registry is single-leg; there is no reference folder' }
+            return $ReferenceLeg
+        }
         'port' { return $PortLeg }
         default { Fail "leg must be 'reference' or 'port' (got '$Leg')" }
     }
@@ -117,8 +165,10 @@ function Get-LegName([string]$Leg) {
 function Ensure-ItemDir([string]$Id) {
     $valid = Assert-ItemId $Id
     $itemRoot = Join-Path $Runs $valid
-    New-Item -ItemType Directory -Force -Path (Join-Path $itemRoot $ReferenceLeg) | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $itemRoot $PortLeg) | Out-Null
+    if (-not $Single) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $itemRoot $ReferenceLeg) | Out-Null
+    }
     return $itemRoot
 }
 

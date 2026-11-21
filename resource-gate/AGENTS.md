@@ -13,8 +13,12 @@ scripts, run them through `powershell -ExecutionPolicy Bypass -File <script>
 
    ```powershell
    .\resource-monitor.ps1 --init --cpu-percent 85 --ram-percent 80 `
-     --disk-percent 90 --streak 3
+     --disk-percent 90 --streak 3 --claude-usage-percent 75
    ```
+
+   `--claude-usage-percent 75` is the Claude subscription gate: once the
+   current 5-hour session reaches it, the monitor caps the recommendation at
+   one Claude subagent. Use `0` to disable the gate.
 
 2. Start the monitor before the first subagent, logging the samples so you can
    read them:
@@ -28,6 +32,21 @@ scripts, run them through `powershell -ExecutionPolicy Bypass -File <script>
    Spawn no more than its `parallel=` value (JSON:
    `recommended_parallel_subagents`) of subagents at a time, and check the
    newest sample again before every further wave.
+
+   The sample also carries `claude_session_percent`,
+   `claude_usage_limit_percent`, `claude_usage_reduced` and
+   `claude_usage_error`. The gate is provider-specific: it only limits agents
+   launched through the `claude` CLI. When `claude_usage_reduced` is true, run
+   at most one Claude fixer at a time even if the resource recommendation is
+   higher. Poll the percentage directly before a Claude wave with:
+
+   ```powershell
+   claude -p "/usage"
+   ```
+
+   and read the `Current session:` line. The monitor polls at most once per
+   `--claude-usage-interval` seconds (default 300), so do not run the command
+   more often than the wave needs.
 
 4. On exit code 3 (pressure) or when the alert JSON appears:
 

@@ -117,6 +117,34 @@ accepted difference is still `reference-verified` when the reference itself is
 the accepted outcome; record the difference in `notes`/`gaps` and in the run
 report.
 
+### Single-leg walk
+
+A registry with `"mode": "single"` (or a `legs` object that declares only
+`port`) records one implementation and no counterpart. It is the same registry,
+queue and evidence layout, with these differences:
+
+- `legs` names the one leg: `{"port": "<evidence-folder name>"}`.
+- `fork` and `action` are keyed by that leg name only, not by role names.
+- No reference folder and no `TWIN_COUNTERPART.md`; `blocked` and `wontfix`
+  need a run report but no frames.
+- Every terminal item needs a `*-run.md` report. Frames are recommended for
+  visual items and kept where a before/after comparison is the evidence; a
+  single-leg item may record structured assertions, digests and UI dumps
+  instead. `twin-verified` still requires frames in both legs.
+- A registry-level `statuses` list may add `bug`, `fixed` and `verified`, and
+  `terminal_statuses` decides when an item leaves the queue. The recommended
+  terminal set for mapping a feature surface is:
+
+  ```json
+  "terminal_statuses": ["verified", "bug", "fixed", "blocked", "wontfix"]
+  ```
+
+  `seeded` -> `in-progress` -> `verified` (works) or `bug` (reproduced defect,
+  documented in the repository's issue file). A later fixer moves `bug` ->
+  `fixed`, and a fresh walk moves `fixed` -> `verified`.
+- The evidence folder is `runs\<item>\<port-leg>\`; the run report records the
+  exact tool chain so another agent can replay it.
+
 ## 5. Evidence layout
 
 ```
