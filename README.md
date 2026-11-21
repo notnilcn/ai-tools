@@ -7,8 +7,8 @@ the root of the repository that adopts the workflows.
 
 | Folder | Purpose |
 |---|---|
-| [`resource-gate/`](resource-gate/AGENTS.md) | Serializes resource-heavy commands and gates waves of parallel subagents on CPU, RAM and disk pressure (Linux/POSIX; PowerShell ports in the `windows` branch). |
-| [`twin/`](twin/AGENTS.md) | Proves one behaviour at a time of a port against a read-only reference, with a durable registry and per-item evidence. |
+| [`resource-gate/`](resource-gate/AGENTS.md) | Serializes resource-heavy commands and gates waves of parallel subagents on CPU, RAM, disk pressure and Claude session usage (Linux/POSIX; PowerShell ports in the `windows` branch). |
+| [`twin/`](twin/AGENTS.md) | Proves one behaviour at a time of a port against a read-only reference, with a durable registry and per-item evidence. The same registry also runs a single-leg feature walk with no counterpart. |
 
 Start with the folder's `AGENTS.md`; it is written to be read and followed by an
 agent. `WORKFLOW.md` in `twin/` holds the full procedure.

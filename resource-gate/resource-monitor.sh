@@ -22,6 +22,11 @@
 # the monitor blame the wave. Override the per-subagent assumptions with
 # RESOURCE_MONITOR_AGENT_CPU_PERCENT / RESOURCE_MONITOR_AGENT_RAM_MB.
 #
+# With --claude-usage-percent the monitor also polls `claude -p /usage` and
+# caps the recommendation at one Claude subagent once the current 5-hour
+# session usage reaches that percentage. Agents of other providers are not
+# capped by it.
+#
 # Linux only: it reads /proc and needs flock and df. On Windows use the
 # PowerShell port in this folder.
 #
@@ -35,6 +40,11 @@
 #   --disk-percent N       used-space ceiling for watched filesystems (saved)
 #   --disk-write-mb N      unqueued writes per sample that count as pressure (saved)
 #   --streak N             consecutive samples over a limit before alerting (saved)
+#   --claude-usage-percent N
+#                          cap Claude subagents at one when the current session
+#                          usage reaches N%; 0 disables the check (saved)
+#   --claude-usage-interval SECS
+#                          seconds between `claude -p /usage` polls (saved)
 #   --init                 save the supplied limits and exit
 #   --path PATH            filesystem to watch; repeatable
 #   --state-dir DIR        lock, limits, alert and scratch state
@@ -69,6 +79,9 @@
 #   RESOURCE_MONITOR_DISK_PERCENT    default for --disk-percent
 #   RESOURCE_MONITOR_DISK_WRITE_MB   default for --disk-write-mb
 #   RESOURCE_MONITOR_STREAK          default for --streak
+#   RESOURCE_MONITOR_CLAUDE_USAGE_PERCENT   default for --claude-usage-percent
+#   RESOURCE_MONITOR_CLAUDE_USAGE_INTERVAL  default for --claude-usage-interval
+#   RESOURCE_MONITOR_CLAUDE_BIN      Claude CLI to poll (default: claude)
 #   RESOURCE_MONITOR_MAX_PARALLEL    hard cap on the recommendation (default 6)
 #   RESOURCE_MONITOR_AGENT_CPU_PERCENT  CPU one subagent is assumed to use (100)
 #   RESOURCE_MONITOR_AGENT_RAM_MB    RAM one subagent is assumed to use (2048)
@@ -163,6 +176,8 @@ ARG_RAM_LIMIT=""
 ARG_DISK_LIMIT=""
 ARG_DISK_WRITE_MB=""
 ARG_STREAK=""
+ARG_CLAUDE_USAGE_PERCENT=""
+ARG_CLAUDE_USAGE_INTERVAL=""
 
 ENV_INTERVAL="${RESOURCE_MONITOR_INTERVAL:-}"
 ENV_CPU_LIMIT="${RESOURCE_MONITOR_CPU_PERCENT:-}"
@@ -170,6 +185,8 @@ ENV_RAM_LIMIT="${RESOURCE_MONITOR_RAM_PERCENT:-}"
 ENV_DISK_LIMIT="${RESOURCE_MONITOR_DISK_PERCENT:-}"
 ENV_DISK_WRITE_MB="${RESOURCE_MONITOR_DISK_WRITE_MB:-}"
 ENV_STREAK="${RESOURCE_MONITOR_STREAK:-}"
+ENV_CLAUDE_USAGE_PERCENT="${RESOURCE_MONITOR_CLAUDE_USAGE_PERCENT:-}"
+ENV_CLAUDE_USAGE_INTERVAL="${RESOURCE_MONITOR_CLAUDE_USAGE_INTERVAL:-}"
 
 FILE_INTERVAL=""
 FILE_CPU_LIMIT=""
@@ -177,6 +194,8 @@ FILE_RAM_LIMIT=""
 FILE_DISK_LIMIT=""
 FILE_DISK_WRITE_MB=""
 FILE_STREAK=""
+FILE_CLAUDE_USAGE_PERCENT=""
+FILE_CLAUDE_USAGE_INTERVAL=""
 
 while (( $# > 0 )); do
   case "$1" in
@@ -186,6 +205,8 @@ while (( $# > 0 )); do
     --disk-percent) (( $# >= 2 )) || die "--disk-percent needs a value"; ARG_DISK_LIMIT="$2"; shift 2 ;;
     --disk-write-mb) (( $# >= 2 )) || die "--disk-write-mb needs a value"; ARG_DISK_WRITE_MB="$2"; shift 2 ;;
     --streak) (( $# >= 2 )) || die "--streak needs a value"; ARG_STREAK="$2"; shift 2 ;;
+    --claude-usage-percent) (( $# >= 2 )) || die "--claude-usage-percent needs a value"; ARG_CLAUDE_USAGE_PERCENT="$2"; shift 2 ;;
+    --claude-usage-interval) (( $# >= 2 )) || die "--claude-usage-interval needs a value"; ARG_CLAUDE_USAGE_INTERVAL="$2"; shift 2 ;;
     --path) (( $# >= 2 )) || die "--path needs a value"; WATCH_PATHS+=("$2"); shift 2 ;;
     --state-dir) (( $# >= 2 )) || die "--state-dir needs a value"; STATE_DIR="$2"; shift 2 ;;
     --alert-file) (( $# >= 2 )) || die "--alert-file needs a value"; ALERT_FILE="$2"; shift 2 ;;
@@ -236,6 +257,8 @@ load_limits_file() {
       disk_percent) FILE_DISK_LIMIT="$value" ;;
       disk_write_mb) FILE_DISK_WRITE_MB="$value" ;;
       streak) FILE_STREAK="$value" ;;
+      claude_usage_percent) FILE_CLAUDE_USAGE_PERCENT="$value" ;;
+      claude_usage_interval) FILE_CLAUDE_USAGE_INTERVAL="$value" ;;
     esac
   done <"$LIMITS_FILE"
   return 0
@@ -265,6 +288,8 @@ RAM_LIMIT="$(pick "$ARG_RAM_LIMIT" "$ENV_RAM_LIMIT" "$FILE_RAM_LIMIT" "")"
 DISK_LIMIT="$(pick "$ARG_DISK_LIMIT" "$ENV_DISK_LIMIT" "$FILE_DISK_LIMIT" "")"
 DISK_WRITE_MB="$(pick "$ARG_DISK_WRITE_MB" "$ENV_DISK_WRITE_MB" "$FILE_DISK_WRITE_MB" 512)"
 STREAK="$(pick "$ARG_STREAK" "$ENV_STREAK" "$FILE_STREAK" "")"
+CLAUDE_USAGE_LIMIT="$(pick "$ARG_CLAUDE_USAGE_PERCENT" "$ENV_CLAUDE_USAGE_PERCENT" "$FILE_CLAUDE_USAGE_PERCENT" 0)"
+CLAUDE_USAGE_INTERVAL="$(pick "$ARG_CLAUDE_USAGE_INTERVAL" "$ENV_CLAUDE_USAGE_INTERVAL" "$FILE_CLAUDE_USAGE_INTERVAL" 300)"
 
 if [[ -z "$CPU_LIMIT" || -z "$RAM_LIMIT" || -z "$DISK_LIMIT" || -z "$STREAK" ]]; then
   cat >&2 <<EOF
@@ -279,6 +304,8 @@ fi
 
 for pair in "interval:$INTERVAL" "cpu-percent:$CPU_LIMIT" "ram-percent:$RAM_LIMIT" \
             "disk-percent:$DISK_LIMIT" "disk-write-mb:$DISK_WRITE_MB" "streak:$STREAK" \
+            "claude-usage-percent:$CLAUDE_USAGE_LIMIT" \
+            "claude-usage-interval:$CLAUDE_USAGE_INTERVAL" \
             "max-samples:$MAX_SAMPLES"; do
   name="${pair%%:*}"
   value="${pair#*:}"
@@ -289,6 +316,8 @@ done
 (( CPU_LIMIT >= 1 && CPU_LIMIT <= 100 )) || die "--cpu-percent must be 1..100"
 (( RAM_LIMIT >= 1 && RAM_LIMIT <= 100 )) || die "--ram-percent must be 1..100"
 (( DISK_LIMIT >= 1 && DISK_LIMIT <= 100 )) || die "--disk-percent must be 1..100"
+(( CLAUDE_USAGE_LIMIT >= 0 && CLAUDE_USAGE_LIMIT <= 100 )) || die "--claude-usage-percent must be 0..100"
+(( CLAUDE_USAGE_INTERVAL >= 10 )) || die "--claude-usage-interval must be at least 10 seconds"
 
 save_limits() {
   mkdir -p "$(dirname -- "$LIMITS_FILE")"
@@ -301,6 +330,8 @@ save_limits() {
     printf 'disk_percent=%s\n' "$DISK_LIMIT"
     printf 'disk_write_mb=%s\n' "$DISK_WRITE_MB"
     printf 'streak=%s\n' "$STREAK"
+    printf 'claude_usage_percent=%s\n' "$CLAUDE_USAGE_LIMIT"
+    printf 'claude_usage_interval=%s\n' "$CLAUDE_USAGE_INTERVAL"
   } >"$tmp"
   mv -f "$tmp" "$LIMITS_FILE"
 }
@@ -321,6 +352,16 @@ fi
 MAX_PARALLEL="${RESOURCE_MONITOR_MAX_PARALLEL:-6}"
 AGENT_CPU_PERCENT="${RESOURCE_MONITOR_AGENT_CPU_PERCENT:-100}"
 AGENT_RAM_MB="${RESOURCE_MONITOR_AGENT_RAM_MB:-2048}"
+
+# Claude session usage gate. The monitor polls the CLI at most once per
+# CLAUDE_USAGE_INTERVAL seconds and never lets its own poll become the wave.
+CLAUDE_BIN="${RESOURCE_MONITOR_CLAUDE_BIN:-claude}"
+CLAUDE_TIMEOUT="${RESOURCE_MONITOR_CLAUDE_TIMEOUT:-45}"
+CLAUDE_SESSION_PERCENT=""
+CLAUDE_USAGE_AT=""
+CLAUDE_USAGE_ERROR=""
+CLAUDE_USAGE_REDUCED=0
+CLAUDE_USAGE_NEXT_NS=0
 
 # A one-shot check is not a monitor; it may run while the wave monitor is alive.
 if (( ONCE == 1 )); then
@@ -753,6 +794,47 @@ compute_metrics() {
 
 RECOMMENDED_PARALLEL=0
 
+poll_claude_usage() {
+  (( CLAUDE_USAGE_LIMIT > 0 )) || return 0
+  local now_ns out percent
+  now_ns="$(date +%s%N)"
+  if (( CLAUDE_USAGE_NEXT_NS > 0 && now_ns < CLAUDE_USAGE_NEXT_NS )); then
+    return 0
+  fi
+  CLAUDE_USAGE_NEXT_NS=$(( now_ns + CLAUDE_USAGE_INTERVAL * 1000000000 ))
+
+  if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+    CLAUDE_USAGE_ERROR="Claude CLI not found: $CLAUDE_BIN"
+    log_line "resource-monitor: claude usage unavailable ($CLAUDE_USAGE_ERROR)"
+    return 0
+  fi
+
+  if ! out="$(timeout "$CLAUDE_TIMEOUT" "$CLAUDE_BIN" -p "/usage" 2>&1)"; then
+    CLAUDE_USAGE_ERROR="claude -p /usage failed or timed out"
+    log_line "resource-monitor: claude usage unavailable ($CLAUDE_USAGE_ERROR)"
+    return 0
+  fi
+
+  percent="$(printf '%s\n' "$out" \
+    | sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
+    | sed -n 's/.*[Cc]urrent session:[[:space:]]*\([0-9][0-9]*\)%[[:space:]]*used.*/\1/p' \
+    | head -n 1)"
+  if [[ ! "$percent" =~ ^[0-9]+$ ]]; then
+    CLAUDE_USAGE_ERROR="could not parse 'Current session' from claude -p /usage"
+    log_line "resource-monitor: claude usage unavailable ($CLAUDE_USAGE_ERROR)"
+    return 0
+  fi
+
+  CLAUDE_SESSION_PERCENT="$percent"
+  CLAUDE_USAGE_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  CLAUDE_USAGE_ERROR=""
+  if (( CLAUDE_SESSION_PERCENT >= CLAUDE_USAGE_LIMIT )); then
+    log_line "resource-monitor: claude session usage ${CLAUDE_SESSION_PERCENT}% >= ${CLAUDE_USAGE_LIMIT}%: capping Claude subagents at 1"
+  else
+    log_line "resource-monitor: claude session usage ${CLAUDE_SESSION_PERCENT}% (limit ${CLAUDE_USAGE_LIMIT}%)"
+  fi
+}
+
 compute_recommendation() {
   local cpu_room_tenths by_cpu ram_room_bytes by_ram cap
   cpu_room_tenths=$(( CPU_LIMIT * 10 - M_CPU_TENTHS ))
@@ -777,6 +859,13 @@ compute_recommendation() {
   (( by_ram < RECOMMENDED_PARALLEL )) && RECOMMENDED_PARALLEL=$by_ram
   (( RECOMMENDED_PARALLEL > cap )) && RECOMMENDED_PARALLEL=$cap
   (( RECOMMENDED_PARALLEL < 0 )) && RECOMMENDED_PARALLEL=0
+
+  CLAUDE_USAGE_REDUCED=0
+  if (( CLAUDE_USAGE_LIMIT > 0 )) && [[ "$CLAUDE_SESSION_PERCENT" =~ ^[0-9]+$ ]] \
+     && (( CLAUDE_SESSION_PERCENT >= CLAUDE_USAGE_LIMIT )); then
+    CLAUDE_USAGE_REDUCED=1
+    (( RECOMMENDED_PARALLEL > 1 )) && RECOMMENDED_PARALLEL=1
+  fi
   return 0
 }
 
@@ -882,12 +971,24 @@ queue_label() {
 }
 
 emit_sample() {
-  local at queue_at cpu ram write disk_text sample parallel
+  local at queue_at cpu ram write disk_text sample parallel claude_pct claude_limit claude_reduced claude_error
   at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   queue_at="$(queue_label)"
   cpu="$(fmt_tenths "$M_CPU_TENTHS")"
   ram="$(fmt_tenths "$M_RAM_TENTHS")"
   write="$(fmt_tenths "$M_WRITE_MB_TENTHS")"
+
+  claude_pct="null"
+  if [[ "$CLAUDE_SESSION_PERCENT" =~ ^[0-9]+$ ]]; then
+    claude_pct="$CLAUDE_SESSION_PERCENT"
+  fi
+  claude_limit="null"
+  if (( CLAUDE_USAGE_LIMIT > 0 )); then
+    claude_limit="$CLAUDE_USAGE_LIMIT"
+  fi
+  claude_reduced="false"
+  (( CLAUDE_USAGE_REDUCED == 1 )) && claude_reduced="true"
+  claude_error="$CLAUDE_USAGE_ERROR"
 
   if (( DISK_MAX_USED_TENTHS > 0 )); then
     disk_text="$(fmt_tenths "$DISK_MAX_USED_TENTHS")%"
@@ -899,18 +1000,20 @@ emit_sample() {
   fi
 
   if (( JSON == 1 )); then
-    printf -v sample '{"at":"%s","event":"sample","cpu_percent":%s,"ram_percent":%s,"ram_bytes":%s,"mem_available_bytes":%s,"write_mb":%s,"disk_used_percent":%s,"disk_min_avail_bytes":%s,"disk_deferred":%s,"queue_active":%s,"queue_task":"%s","recommended_parallel_subagents":%s,"streaks":{"cpu":%s,"ram":%s,"disk":%s,"write":%s}}' \
+    printf -v sample '{"at":"%s","event":"sample","cpu_percent":%s,"ram_percent":%s,"ram_bytes":%s,"mem_available_bytes":%s,"write_mb":%s,"disk_used_percent":%s,"disk_min_avail_bytes":%s,"disk_deferred":%s,"queue_active":%s,"queue_task":"%s","recommended_parallel_subagents":%s,"claude_session_percent":%s,"claude_usage_limit_percent":%s,"claude_usage_reduced":%s,"claude_usage_error":"%s","claude_usage_at":"%s","streaks":{"cpu":%s,"ram":%s,"disk":%s,"write":%s}}' \
       "$at" "$cpu" "$ram" "$M_RAM_BYTES" "$MEM_AVAILABLE_BYTES" "$write" \
       "$(fmt_tenths "$DISK_MAX_USED_TENTHS")" "$DISK_MIN_AVAIL_BYTES" \
       "$( (( DISK_DEFERRED == 1 )) && echo true || echo false )" \
       "$( (( QUEUE_ACTIVE == 1 )) && echo true || echo false )" \
       "$(json_escape "$QUEUE_TASK")" \
       "$RECOMMENDED_PARALLEL" \
+      "$claude_pct" "$claude_limit" "$claude_reduced" \
+      "$(json_escape "$claude_error")" "$(json_escape "$CLAUDE_USAGE_AT")" \
       "$CPU_STREAK" "$RAM_STREAK" "$DISK_STREAK" "$WRITE_STREAK"
     printf '%s\n' "$sample"
     if [[ -n "$LOG_FILE" ]]; then printf '%s\n' "$sample" >>"$LOG_FILE"; fi
   else
-    log_line "cpu=${cpu}% ram=${ram}% disk=${disk_text} write=${write}MB queue=${queue_at} parallel=${RECOMMENDED_PARALLEL}"
+    log_line "cpu=${cpu}% ram=${ram}% disk=${disk_text} write=${write}MB queue=${queue_at} parallel=${RECOMMENDED_PARALLEL} claude=${claude_pct}%$([[ "$claude_reduced" == "true" ]] && echo " cap=1")"
   fi
 }
 
@@ -996,7 +1099,11 @@ build_reasons() {
 
 write_alert_json() {
   local at processes_json="" disk_json="" reasons_json="" protected_json="" sep i reason p
+  local claude_pct_json="null" claude_limit_json="null" claude_reduced_json="false"
   at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$CLAUDE_SESSION_PERCENT" =~ ^[0-9]+$ ]]; then claude_pct_json="$CLAUDE_SESSION_PERCENT"; fi
+  if (( CLAUDE_USAGE_LIMIT > 0 )); then claude_limit_json="$CLAUDE_USAGE_LIMIT"; fi
+  (( CLAUDE_USAGE_REDUCED == 1 )) && claude_reduced_json="true"
 
   # The monitor and its ancestors must never be kill targets. Add the queue
   # holder's group too when it is still alive.
@@ -1050,7 +1157,9 @@ write_alert_json() {
     "disk_percent": $DISK_LIMIT,
     "disk_write_mb": $DISK_WRITE_MB,
     "streak": $STREAK,
-    "interval_s": $INTERVAL
+    "interval_s": $INTERVAL,
+    "claude_usage_percent": $claude_limit_json,
+    "claude_usage_interval_s": $CLAUDE_USAGE_INTERVAL
   },
   "metrics": {
     "cpu_percent": $(fmt_tenths "$M_CPU_TENTHS"),
@@ -1071,12 +1180,19 @@ write_alert_json() {
     "parallel_subagents": $RECOMMENDED_PARALLEL,
     "note": "0 means stop spawning; restart only after two clean samples."
   },
+  "claude_usage": {
+    "session_percent": $claude_pct_json,
+    "limit_percent": $claude_limit_json,
+    "reduced_to_one": $claude_reduced_json,
+    "at": "$(json_escape "$CLAUDE_USAGE_AT")",
+    "error": "$(json_escape "$CLAUDE_USAGE_ERROR")"
+  },
   "protected_pgids": [$protected_json],
   "reasons": [$reasons_json],
   "disk": [$disk_json],
   "processes": [$processes_json],
   "kill_note": "Kill only PID trees that belong to the tasks you stop; process groups may be shared with the orchestrator. Never kill the monitor, its ancestors, the orchestrator, or the queue holder.",
-  "required_action": "Stop spawning subagents. Kill the process trees of the tasks you stop (see processes above; verify cwd/cmd first). Reduce parallelism 6->4->2->1. Restart the monitor only after two clean samples."
+  "required_action": "Stop spawning subagents. Kill the process trees of the tasks you stop (see processes above; verify cwd/cmd first). Reduce parallelism 6->4->2->1. Keep at most one Claude subagent while claude_usage.reduced_to_one is true. Restart the monitor only after two clean samples."
 }
 EOF
   mv -f "$ALERT_FILE.tmp.$$" "$ALERT_FILE"
@@ -1101,6 +1217,13 @@ emit_alert() {
     alert_line "  disk: $(fmt_tenths "$DISK_MAX_USED_TENTHS")% used (limit ${DISK_LIMIT}%)"
   fi
   alert_line "  unmanaged writes: $(fmt_tenths "$M_WRITE_MB_TENTHS")MB/sample (limit ${DISK_WRITE_MB}MB)"
+  if (( CLAUDE_USAGE_LIMIT > 0 )); then
+    if [[ "$CLAUDE_SESSION_PERCENT" =~ ^[0-9]+$ ]]; then
+      alert_line "  claude session usage: ${CLAUDE_SESSION_PERCENT}% (limit ${CLAUDE_USAGE_LIMIT}%)$( (( CLAUDE_USAGE_REDUCED == 1 )) && printf ', capped at 1 Claude subagent' )"
+    else
+      alert_line "  claude session usage: unavailable (${CLAUDE_USAGE_ERROR:-not polled yet}; limit ${CLAUDE_USAGE_LIMIT}%)"
+    fi
+  fi
   alert_line "  queue: $(queue_label)"
   alert_line "  recommended parallel subagents: ${RECOMMENDED_PARALLEL}"
   if (( ${#TOP_PID[@]} == 0 )); then
@@ -1126,6 +1249,11 @@ emit_alert() {
 
 read_meminfo
 log_line "resource-monitor: watching ${WATCH_PATHS[*]} every ${INTERVAL}s (cpu<=${CPU_LIMIT}%, ram<=${RAM_LIMIT}%, disk<${DISK_LIMIT}%, writes<=${DISK_WRITE_MB}MB, streak=${STREAK})"
+if (( CLAUDE_USAGE_LIMIT > 0 )); then
+  log_line "resource-monitor: Claude session usage gate: cap at 1 subagent from ${CLAUDE_USAGE_LIMIT}% (poll every ${CLAUDE_USAGE_INTERVAL}s)"
+else
+  log_line "resource-monitor: Claude session usage gate: disabled"
+fi
 log_line "resource-monitor: queue-exempt = processes with RESOURCE_QUEUE_HELD=1 or descendants of the queue holder"
 log_line "resource-monitor: alert json: $ALERT_FILE"
 
@@ -1136,6 +1264,7 @@ while :; do
   queue_state
   read_meminfo
   sample_processes
+  poll_claude_usage
   compute_metrics
   sample_disks
   update_streaks

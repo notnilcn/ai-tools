@@ -20,9 +20,12 @@
 #   TWIN_RUNS            evidence root (default: <root>/runs)
 #   TWIN_REFERENCE_LEG   reference leg folder name (default: reference)
 #   TWIN_PORT_LEG        port leg folder name (default: port)
+#   TWIN_SINGLE          set to 1 to record one leg only (no reference folder)
 #
-# The two leg names must match the registry's "legs" object and
-# TWIN_COUNTERPART.md.
+# The leg names must match the registry's "legs" object and
+# TWIN_COUNTERPART.md. A registry with "mode": "single" (or a "legs" object
+# without a reference role) is recorded as a single-leg walk automatically:
+# only the port folder is created and `capture reference` is rejected.
 
 set -euo pipefail
 
@@ -83,6 +86,60 @@ RUNS="${TWIN_RUNS:-$ROOT/runs}"
 REFERENCE_LEG="${TWIN_REFERENCE_LEG:-reference}"
 PORT_LEG="${TWIN_PORT_LEG:-port}"
 
+registry_leg() {
+  local role="$1"
+  local registry="$ROOT/$REGISTRY_NAME"
+  [[ -f "$registry" ]] || return 1
+  python3 - "$registry" "$role" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+legs = doc.get("legs")
+if not isinstance(legs, dict):
+    raise SystemExit(1)
+value = legs.get(sys.argv[2])
+if not isinstance(value, str) or not value.strip():
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+is_single_registry() {
+  local registry="$ROOT/$REGISTRY_NAME"
+  [[ -f "$registry" ]] || return 1
+  python3 - "$registry" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+mode = doc.get("mode")
+legs = doc.get("legs")
+single = mode in ("single", "feature-walk", "single-leg")
+if isinstance(legs, dict) and legs and "reference" not in legs and "port" in legs:
+    single = True
+raise SystemExit(0 if single else 1)
+PY
+}
+
+SINGLE=0
+if [[ "${TWIN_SINGLE:-}" == "1" ]] || is_single_registry; then
+  SINGLE=1
+fi
+
+if [[ -z "${TWIN_PORT_LEG:-}" ]]; then
+  if value="$(registry_leg port 2>/dev/null)" && [[ -n "$value" ]]; then
+    PORT_LEG="$value"
+  fi
+fi
+if [[ -z "${TWIN_REFERENCE_LEG:-}" ]] && (( SINGLE == 0 )); then
+  if value="$(registry_leg reference 2>/dev/null)" && [[ -n "$value" ]]; then
+    REFERENCE_LEG="$value"
+  fi
+fi
+
 stamp() {
   date +%Y%m%d-%H%M%S
 }
@@ -100,7 +157,10 @@ item_id() {
 leg_dir() {
   local leg="${1:-}"
   case "$leg" in
-    reference) printf '%s\n' "$REFERENCE_LEG" ;;
+    reference)
+      (( SINGLE == 1 )) && die "this registry is single-leg; there is no reference folder"
+      printf '%s\n' "$REFERENCE_LEG"
+      ;;
     port) printf '%s\n' "$PORT_LEG" ;;
     *) die "leg must be 'reference' or 'port' (got '$leg')" ;;
   esac
@@ -109,7 +169,10 @@ leg_dir() {
 ensure_dir() {
   local id
   id="$(item_id "${1:-}")"
-  mkdir -p "$RUNS/$id/$REFERENCE_LEG" "$RUNS/$id/$PORT_LEG"
+  mkdir -p "$RUNS/$id/$PORT_LEG"
+  if (( SINGLE == 0 )); then
+    mkdir -p "$RUNS/$id/$REFERENCE_LEG"
+  fi
   printf '%s\n' "$RUNS/$id"
 }
 

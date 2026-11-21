@@ -1,0 +1,49 @@
+{
+  "schema": "ai-tools/feature-verification@1",
+  "mode": "single",
+  "updated": "2026-11-18T00:00:00Z",
+  "legs": {
+    "port": "editor"
+  },
+  "statuses": [
+    "seeded",
+    "in-progress",
+    "bug",
+    "fixing",
+    "fixed",
+    "verified",
+    "blocked",
+    "wontfix"
+  ],
+  "terminal_statuses": [
+    "verified",
+    "bug",
+    "fixed",
+    "blocked",
+    "wontfix"
+  ],
+  "items": {
+    "FEAT-0001": {
+      "title": "Replace with one observable feature behaviour",
+      "status": "seeded",
+      "action": {
+        "editor": [
+          {
+            "tool": "replace-with-input-tool",
+            "params": {
+              "x": 0,
+              "y": 0,
+              "button": "left"
+            }
+          }
+        ]
+      },
+      "acceptance": [
+        "Replace with the observable assertion that closes this item."
+      ],
+      "notes": ""
+    }
+  },
+  "recipes": {},
+  "gaps": []
+}
