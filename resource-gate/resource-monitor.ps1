@@ -11,7 +11,11 @@
 #        .\resource-monitor.ps1 --init --cpu-percent 85 --ram-percent 80 `
 #          --disk-percent 90 --streak 3
 #   2. Start the monitor before the first wave, for example as a background job:
-#        Start-Job -FilePath .\resource-monitor.ps1 -ArgumentList '--json','--log','.tmp\resource-monitor\monitor.log'
+#        $monitor = (Resolve-Path .\resource-monitor.ps1).Path
+#        Start-Job -ScriptBlock { param($m, $a) & $m @a } `
+#          -ArgumentList $monitor, @('--json','--log','.tmp\resource-monitor\monitor.log')
+#      Do not use Start-Job -FilePath: on Windows PowerShell 5.1 it drops the
+#      script's folder, which the monitor needs to find the repository.
 #   3. Spawn at most `parallel=` subagents, from the latest sample.
 #   4. On exit code 3, stop spawning, read the alert JSON and follow its
 #      `required_action`. Restart the monitor only after two clean samples.
@@ -63,6 +67,9 @@
 # Environment:
 #   RESOURCE_GATE_REPO_ROOT          repository to watch (default: the git top
 #                                    level that contains this checkout)
+#   RESOURCE_GATE_SCRIPT_DIR         folder holding this script, used only when
+#                                    it cannot be detected (Start-Job -FilePath
+#                                    on Windows PowerShell 5.1)
 #   RESOURCE_QUEUE_DIR               queue state directory shared with
 #                                    run-resource-intensive-task.ps1 (default:
 #                                    <git-common-dir>\resource-queue)
@@ -87,15 +94,33 @@ $RawArgs = @($args)
 $script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 function Fail([string]$Message) {
-    [Console]::Error.WriteLine("resource-monitor: $Message")
+    Write-Diagnostic "resource-monitor: $Message"
     exit 2
+}
+
+# [Console]::Error is discarded inside a background job, and $Host.UI is
+# discarded in a plain console redirect. Pick the one that survives here so a
+# failure is never silent.
+function Write-Diagnostic([string]$Message) {
+    if ($null -ne $PSSenderInfo) {
+        $Host.UI.WriteErrorLine($Message)
+    } else {
+        [Console]::Error.WriteLine($Message)
+    }
 }
 
 function Get-Usage {
     # Print the comment block above, so --help and the file never disagree.
     $output = New-Object System.Collections.Generic.List[string]
+    $path = $PSCommandPath
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        $path = Join-Path $ScriptDir 'resource-monitor.ps1'
+    }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return 'resource-monitor.ps1 (help text unavailable: script path not found)'
+    }
     $show = $false
-    foreach ($line in (Get-Content -LiteralPath $PSCommandPath)) {
+    foreach ($line in (Get-Content -LiteralPath $path)) {
         if ($line -match '^# Usage:') { $show = $true }
         if ($show -and $line -notmatch '^#') { break }
         if ($show) { $output.Add(($line -replace '^# ?', '')) }
@@ -105,13 +130,69 @@ function Get-Usage {
 
 # --- localization ----------------------------------------------------------
 
-$ScriptDir = $PSScriptRoot
+# $PSScriptRoot is empty when the script is launched with
+# `Start-Job -FilePath` on Windows PowerShell 5.1: that parameter sends the
+# script text to the job, so the path is gone and the job's PWD is unrelated.
+# Fall back to the other places the folder can come from, and return '' when
+# none is real, so the caller can refuse instead of watching the wrong folder.
+function Get-ScriptDir {
+    foreach ($candidate in @($PSScriptRoot, $env:RESOURCE_GATE_SCRIPT_DIR)) {
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Container)) {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    if ($PSCommandPath) {
+        $parent = Split-Path -Parent $PSCommandPath
+        if ($parent -and (Test-Path -LiteralPath $parent -PathType Container)) {
+            return [System.IO.Path]::GetFullPath($parent)
+        }
+    }
+    $definition = [string]$MyInvocation.MyCommand.Definition
+    if ($definition -and $definition -notmatch '[\r\n]' -and (Test-Path -LiteralPath $definition -PathType Leaf)) {
+        return [System.IO.Path]::GetFullPath((Split-Path -Parent $definition))
+    }
+    return ''
+}
+
+$ScriptDir = Get-ScriptDir
+if (-not $ScriptDir) {
+    Write-Diagnostic 'resource-monitor: cannot find the folder holding this script.'
+    Write-Diagnostic 'This happens with `Start-Job -FilePath`, which passes the script text and loses its path.'
+    Write-Diagnostic 'Start it from a script block instead, keeping the path:'
+    Write-Diagnostic "  `$monitor = (Resolve-Path '.\resource-monitor.ps1').Path"
+    Write-Diagnostic "  Start-Job -ScriptBlock { param(`$m, `$a) & `$m @a } -ArgumentList `$monitor, @('--json')"
+    Write-Diagnostic 'Or set RESOURCE_GATE_SCRIPT_DIR to the folder holding resource-monitor.ps1.'
+    exit 2
+}
 $ToolsDir = [System.IO.Path]::GetFullPath((Join-Path $ScriptDir '..'))
+
+# Windows PowerShell 5.1 turns a native command's stderr into a terminating
+# error while $ErrorActionPreference is 'Stop', and `git` prints its "not a
+# repository" complaint to stderr. Call it with a local preference so a folder
+# that is not a repository yields an empty answer instead of a crash.
+function Invoke-Git([string[]]$GitArgs) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $output = @()
+    $code = 1
+    try {
+        $output = @(& git @GitArgs 2>&1)
+        if ($null -ne $LASTEXITCODE) { $code = [int]$LASTEXITCODE }
+    } catch {
+        $code = 1
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    return [pscustomobject]@{ Output = $output; ExitCode = $code }
+}
 
 function Get-GitTop([string]$Path) {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return '' }
-    $top = & git -C $Path rev-parse --show-toplevel 2>$null
-    if ($LASTEXITCODE -eq 0 -and $top) { return ([string]$top).Trim() }
+    $result = Invoke-Git @('-C', $Path, 'rev-parse', '--show-toplevel')
+    if ($result.ExitCode -eq 0 -and $result.Output.Count -gt 0) {
+        $top = ([string]$result.Output[0]).Trim()
+        if ($top) { return $top }
+    }
     return ''
 }
 
@@ -146,11 +227,11 @@ function Get-QueueDir {
     }
     $common = $null
     if (Get-Command git -ErrorAction SilentlyContinue) {
-        $common = & git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not $common) {
-            $common = & git -C $RepoRoot rev-parse --git-common-dir 2>$null
+        $result = Invoke-Git @('-C', $RepoRoot, 'rev-parse', '--path-format=absolute', '--git-common-dir')
+        if ($result.ExitCode -ne 0 -or $result.Output.Count -eq 0) {
+            $result = Invoke-Git @('-C', $RepoRoot, 'rev-parse', '--git-common-dir')
         }
-        if ($LASTEXITCODE -ne 0) { $common = $null }
+        if ($result.ExitCode -eq 0 -and $result.Output.Count -gt 0) { $common = $result.Output[0] }
     }
     if (-not $common) { return (Join-Path $RepoRoot '.resource-queue') }
     $common = ([string]$common).Trim()
@@ -318,11 +399,11 @@ $ClaudeUsageRaw = Get-ConfigValue $Options.ClaudeUsage 'RESOURCE_MONITOR_CLAUDE_
 $ClaudeUsageIntervalRaw = Get-ConfigValue $Options.ClaudeUsageInterval 'RESOURCE_MONITOR_CLAUDE_USAGE_INTERVAL' $FileLimits 'claude_usage_interval' '300'
 
 if (-not $CpuLimitRaw -or -not $RamLimitRaw -or -not $DiskLimitRaw -or -not $StreakRaw) {
-    [Console]::Error.WriteLine('resource-monitor: warning limits are not defined.')
-    [Console]::Error.WriteLine('The orchestrator needs to define the limits for the resource monitor warnings before starting a wave.')
-    [Console]::Error.WriteLine('Define them once with:')
-    [Console]::Error.WriteLine("  $PSCommandPath --cpu-percent N --ram-percent N --disk-percent N --streak N [--disk-write-mb N]")
-    [Console]::Error.WriteLine("The limits are saved to $LimitsFile.")
+    Write-Diagnostic 'resource-monitor: warning limits are not defined.'
+    Write-Diagnostic 'The orchestrator needs to define the limits for the resource monitor warnings before starting a wave.'
+    Write-Diagnostic 'Define them once with:'
+    Write-Diagnostic "  $(Join-Path $ScriptDir 'resource-monitor.ps1') --cpu-percent N --ram-percent N --disk-percent N --streak N [--disk-write-mb N]"
+    Write-Diagnostic "The limits are saved to $LimitsFile."
     exit 2
 }
 
@@ -427,11 +508,11 @@ if ($LogFile) {
 }
 
 if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
-    [Console]::Error.WriteLine("resource-monitor: Get-CimInstance is required (Windows PowerShell 3+).")
+    Write-Diagnostic 'resource-monitor: Get-CimInstance is required (Windows PowerShell 3+).'
     exit 1
 }
 if (-not (Get-Command Get-Process -ErrorAction SilentlyContinue)) {
-    [Console]::Error.WriteLine("resource-monitor: Get-Process is required.")
+    Write-Diagnostic 'resource-monitor: Get-Process is required.'
     exit 1
 }
 
@@ -491,7 +572,7 @@ if ($UseLock) {
         )
         Remove-Item $AlertFile -Force -ErrorAction SilentlyContinue
     } catch {
-        [Console]::Error.WriteLine("resource-monitor: another monitor is already running for $StateDir")
+        Write-Diagnostic "resource-monitor: another monitor is already running for $StateDir"
         exit 4
     }
 }

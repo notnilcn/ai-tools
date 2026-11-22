@@ -24,9 +24,15 @@ scripts, run them through `powershell -ExecutionPolicy Bypass -File <script>
    read them:
 
    ```powershell
-   Start-Job -FilePath .\resource-monitor.ps1 `
-     -ArgumentList '--json', '--log', '.tmp\resource-monitor\monitor.log'
+   $monitor = (Resolve-Path .\resource-monitor.ps1).Path
+   Start-Job -ScriptBlock { param($m, $a) & $m @a } `
+     -ArgumentList $monitor, @('--json', '--log', '.tmp\resource-monitor\monitor.log')
    ```
+
+   Do not use `Start-Job -FilePath`: on Windows PowerShell 5.1 it sends only the
+   script text to the job, so the monitor cannot find its own folder (and its own
+   checkout) and refuses to start. If you must use it, also set
+   `RESOURCE_GATE_SCRIPT_DIR` to the folder holding `resource-monitor.ps1`.
 
 3. Read the newest sample (`Get-Content -Tail 1 .tmp\resource-monitor\monitor.log`).
    Spawn no more than its `parallel=` value (JSON:
